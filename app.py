@@ -158,11 +158,14 @@ def process_zip(data: bytes) -> dict:
             score, reasons = 25, [f"High-risk country: {country}"]
         docs = [f for f in out["files"] if reg and reg in f["file"]]
         quarantined = [f["file"] for f in docs if f["status"] == "Quarantined"]
+        unreadable = [f["file"] for f in docs if f["status"].startswith(("Unreadable", "Skipped"))]
         if quarantined:
             reasons.append("Document quarantined: " + ", ".join(quarantined))
+        if unreadable:
+            reasons.append("Document unreadable, needs manual check: " + ", ".join(unreadable))
         if score >= 75:
             status = "High Risk"
-        elif score == 25 or quarantined:
+        elif score == 25 or quarantined or unreadable:
             status = "Needs Review"
         else:
             status = "Low Risk: no flags"
@@ -176,7 +179,7 @@ def process_zip(data: bytes) -> dict:
 # UI
 # ---------------------------------------------------------------------------
 def log(event: str, subject: str = "", detail: str = ""):
-    st.session_state.audit.append({"Time": datetime.now().strftime("%H:%M:%S"),
+    st.session_state.audit.append({"Time": datetime.utcnow().strftime("%H:%M:%S") + " UTC",
                                    "Event": event, "Subject": subject, "Detail": detail})
 
 
