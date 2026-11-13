@@ -1,6 +1,6 @@
 """Summit Risk: Vendor Risk Agent demo.
 
-Upload a ZIP containing vendors.csv and PDF documents. The agent scans every PDF
+Upload a ZIP containing vendors.csv and PDF or text documents. The agent scans every file
 for injection phrases first, scores vendor names against a hard-coded demo
 sanctions list (Levenshtein exact/fuzzy match), and queues every vendor for a
 human decision. Nothing is ever blocked or cleared automatically.
@@ -15,7 +15,12 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-SANCTIONED_NAMES = ["Acme Corp", "Global Trading"]          # demo list only
+SANCTIONED_NAMES = [                                          # mock list only, not a real source
+    "Acme Corp", "Global Trading",
+    "Acme Trading Ltd", "Global Shipping Co", "Tech Innovations LLC", "North Star Mining",
+    "Al Baraka Exchange", "Mekong Timber Group", "Baltic Marine Group", "Ironclad Security",
+    "Quantum Chips Ltd", "Gulf Finance House", "Vostok Aviation", "Persian Petrochem",
+]
 HIGH_RISK_COUNTRIES = ["Iran", "North Korea", "Syria"]      # demo list only
 FUZZY_THRESHOLD = 0.85
 MAX_FILES = 200
@@ -30,6 +35,7 @@ INJECTION_PATTERNS = [
     r"rank\s+me\s+(first|number\s+one|#1|at\s+the\s+top)",
     r"you\s+are\s+now\s+(a|an|the)\b",
     r"override\s+(the\s+)?(rules|instructions|safety)",
+    r"note\s+to\s+(the\s+)?(ai|assistant|model|llm)\b",
 ]
 
 
@@ -96,6 +102,12 @@ def match_name(name: str):
 # ---------------------------------------------------------------------------
 # ZIP processing
 # ---------------------------------------------------------------------------
+def read_doc_text(name: str, data: bytes) -> str:
+    if name.lower().endswith(".txt"):
+        return data.decode("utf-8", errors="ignore").strip()
+    return read_pdf_text(data)
+
+
 def read_pdf_text(data: bytes) -> str:
     try:
         from pypdf import PdfReader
@@ -131,15 +143,15 @@ def process_zip(data: bytes) -> dict:
         out["error"] = "vendors.csv is missing column(s): " + ", ".join(missing)
         return out
 
-    # 1. Quarantine scan on every PDF, before anything else uses the text
+    # 1. Quarantine scan on every PDF and text file, before anything else uses the text
     for n in names:
-        if not n.lower().endswith(".pdf"):
+        if not n.lower().endswith((".pdf", ".txt")):
             continue
         base = n.split("/")[-1]
         if z.getinfo(n).file_size > MAX_PDF_BYTES:
             out["files"].append({"file": base, "status": "Skipped (too large)"})
             continue
-        text = read_pdf_text(z.read(n))
+        text = read_doc_text(n, z.read(n))
         if not text:
             out["files"].append({"file": base, "status": "Unreadable (no text; needs OCR)"})
         elif is_injection(text):
@@ -151,6 +163,7 @@ def process_zip(data: bytes) -> dict:
     for _, row in df.iterrows():
         name, country, reg = row["name"].strip(), row["country"].strip(), row["registration_number"].strip()
         score, reasons = 0, []
+        csv_injection = any(is_injection(str(c)) for c in row.values)
         s, why = match_name(name)
         if s:
             score, reasons = s, [why]
@@ -159,13 +172,17 @@ def process_zip(data: bytes) -> dict:
         docs = [f for f in out["files"] if reg and reg in f["file"]]
         quarantined = [f["file"] for f in docs if f["status"] == "Quarantined"]
         unreadable = [f["file"] for f in docs if f["status"].startswith(("Unreadable", "Skipped"))]
+        if csv_injection:
+            reasons.append("Injection text found in the CSV row")
         if quarantined:
             reasons.append("Document quarantined: " + ", ".join(quarantined))
         if unreadable:
             reasons.append("Document unreadable, needs manual check: " + ", ".join(unreadable))
-        if score >= 75:
+        if quarantined or csv_injection:
+            status = "Quarantined: File Malicious"
+        elif score >= 75:
             status = "High Risk"
-        elif score == 25 or quarantined or unreadable:
+        elif score == 25 or unreadable:
             status = "Needs Review"
         else:
             status = "Low Risk: no flags"
@@ -195,10 +212,10 @@ def main():
         if k not in st.session_state:
             st.session_state[k] = v
     st.title("🛡️ Summit Risk: Vendor Risk Agent")
-    st.markdown("**Demo: upload a ZIP with `vendors.csv` and PDF documents.**")
+    st.markdown("**Demo: upload a ZIP with `vendors.csv` and PDF or text documents.**")
     st.sidebar.header("Agent Rules")
-    st.sidebar.info("1. Every PDF is scanned for injection before it is used.\n"
-                    "2. Scores come from the CSV, never from PDF text.\n"
+    st.sidebar.info("1. Every PDF and text file is scanned for injection before it is used.\n"
+                    "2. Scores come from the CSV, never from document text.\n"
                     "3. Names are matched with Levenshtein: exact = 100, fuzzy = 75.\n"
                     "4. No vendor is blocked or cleared automatically. A person decides.")
     st.sidebar.caption("The sanctions list in this demo is a hard-coded sample, not a real source.")
@@ -213,18 +230,20 @@ def main():
         else:
             st.write("### 1. Pre-flight check")
             q = [f for f in res["files"] if f["status"] == "Quarantined"]
-            st.success(f"{len(res['vendors'])} vendors in vendors.csv. {len(res['files'])} PDF file(s) scanned.")
+            qcsv = [v["Vendor Name"][:40] for v in res["vendors"] if "CSV row" in v["Reason"]]
+            st.success(f"{len(res['vendors'])} vendors in vendors.csv. {len(res['files'])} document(s) scanned.")
             if res["files"]:
                 st.dataframe(pd.DataFrame(res["files"]), use_container_width=True, hide_index=True)
-            if q:
-                st.error("🚨 Quarantine Alert: Injection detected in: " + ", ".join(f["file"] for f in q)
-                         + ". These files were not read further.")
+            if q or qcsv:
+                st.error("🚨 Quarantine Alert: Malicious files detected: "
+                         + ", ".join([f["file"] for f in q] + [f"CSV row '{n}'" for n in qcsv])
+                         + ". Nothing flagged was read further. Quarantined vendors cannot be approved until a person resolves them.")
             for f in res["files"]:
                 if f["status"] != "Clean":
                     log_once(key + (f["file"],), f"File {f['status'].split(' (')[0].lower()}", f["file"], "")
-            for v in res["vendors"]:
+            for vi, v in enumerate(res["vendors"]):
                 if v["Status"] != "Low Risk: no flags":
-                    log_once(key + (v["Registration"] or v["Vendor Name"], "flag"),
+                    log_once(key + (vi, "flag"),
                              "Vendor flagged: " + v["Status"], v["Vendor Name"], v["Reason"])
 
             st.write("### 2. Screening results")
@@ -232,7 +251,10 @@ def main():
 
             st.write("### 3. Human approval queue")
             st.info("The agent prepares. The human decides. Nothing is cleared or blocked until you act.")
-            for i, v in enumerate(res["vendors"]):
+            tier = {"Quarantined": 0, "High Risk": 1, "Needs Review": 2}
+            order = sorted(enumerate(res["vendors"]),
+                           key=lambda p: (tier.get(p[1]["Status"].split(":")[0], 3), p[0]))
+            for i, v in order:
                 vid = (key, i)
                 done = st.session_state.decisions.get(vid)
                 label = f"{v['Vendor Name']} ({v['Status']})" + (f" | decision: {done}" if done else "")
@@ -240,7 +262,20 @@ def main():
                     st.write(f"**Score:** {v['Score']} | **Reason:** {v['Reason']}")
                     reason = st.text_input("Reason (required to dismiss)", key=f"why_{i}")
                     c1, c2, c3 = st.columns(3)
-                    if c1.button("✅ Approve", key=f"ap_{i}"):
+                    if v["Status"].startswith("Quarantined"):
+                        c1.caption("🔒 Cannot be approved until the file is resolved.")
+                        if c1.button("🚫 Confirm Malicious", key=f"cm_{i}"):
+                            st.session_state.decisions[vid] = "Blocked (confirmed malicious)"
+                            log("Quarantine confirmed malicious by reviewer", v["Vendor Name"], reason)
+                            st.rerun()
+                        if c1.button("🔓 Release file", key=f"rl_{i}"):
+                            if reason.strip():
+                                st.session_state.decisions[vid] = "Quarantine released"
+                                log("Quarantine released by reviewer", v["Vendor Name"], reason)
+                                st.rerun()
+                            else:
+                                st.warning("Enter a reason to release.")
+                    elif c1.button("✅ Approve", key=f"ap_{i}"):
                         st.session_state.decisions[vid] = "Approved"
                         log("Vendor approved by reviewer", v["Vendor Name"], reason)
                         st.rerun()
