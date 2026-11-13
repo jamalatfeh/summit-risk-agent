@@ -64,14 +64,28 @@ def ratio(a: str, b: str) -> float:
     return 1.0 if longest == 0 else 1 - levenshtein(a, b) / longest
 
 
+LEGAL_SUFFIXES = {"co", "llc", "ltd", "inc", "corp", "corporation", "company", "trading", "limited", "fze", "fzco", "group"}
+
+
+def strip_suffixes(n: str) -> str:
+    words = n.split()
+    while len(words) > 1 and words[-1] in LEGAL_SUFFIXES:
+        words.pop()
+    return " ".join(words)
+
+
 def match_name(name: str):
-    """Return (score, reason). 100 exact, 75 fuzzy, 0 none."""
+    """Return (score, reason). 100 exact, 75 fuzzy or suffix variant, 0 none."""
     n = norm_name(name)
     best, best_ratio = None, 0.0
     for s in SANCTIONED_NAMES:
-        r = ratio(n, norm_name(s))
+        ns = norm_name(s)
+        r = ratio(n, ns)
         if r == 1.0:
             return 100, f"Exact sanctions match: {s}"
+        if n != ns and (n.startswith(ns + " ") or ns.startswith(n + " ")) \
+                and strip_suffixes(n) == strip_suffixes(ns):
+            return 75, f"Fuzzy sanctions match: {s} (same name plus a company suffix)"
         if r > best_ratio:
             best, best_ratio = s, r
     if best_ratio >= FUZZY_THRESHOLD:
